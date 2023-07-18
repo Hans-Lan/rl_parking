@@ -195,8 +195,14 @@ class ParkingLots(gym.Env):
         #     mode = self.np_random.choice(3, p=[(1-p)*0.1, (1-p)*0.9, p])
 
         # mode = self.np_random.choice(3, p=[0.5, 0.3, 0.2])
-        mode = self.np_random.choice(3, p=[0.7, 0.3, 0.0])
-        mode = 1
+        if self.frac < 0.5:
+            mode = self.np_random.choice(3, p=[0.7, 0.3, 0.0])
+        elif self.frac < 1.0:
+            p = self.frac * 0.6
+            mode = self.np_random.choice(3, p=[1-p, p, 0.0])
+        else:
+            mode = self.np_random.choice(3, p=[0.1, 0.6, 0.3])
+        # mode = 1
         if mode == 0:
             high = np.array([0.1, -car_l / 2 + car_d + 3.5, np.pi / 2 + 0.1, 0, 0])
             low = np.array([-0.1, -car_l / 2 + car_d + 0.2, np.pi / 2 - 0.1, 0, 0])
@@ -208,7 +214,7 @@ class ParkingLots(gym.Env):
                 x_bias_low = 0.
             else:
                 x_bias_high = (y_bias - 1.5)
-                x_bias_low = 0.3
+                x_bias_low = 0.4
             # print(y_bias, ang_bias, x_bias_high, x_bias_low)
             # high = np.array([0.5, -car_l / 2 + car_d + high_bias, np.pi / 2 + 0.2, 0, 0])
             # low = np.array([0.2, -car_l / 2 + car_d + 3.5, np.pi / 2 - ang_bias, 0, 0])
@@ -218,7 +224,7 @@ class ParkingLots(gym.Env):
             # low_bias = self.np_random.uniform(low=2.5, high=3.5)
             # angle = (3.5 - low_bias) * np.pi / 6 + 0.3
             high = np.array([5.5, car_l / 2 + 3.5, np.pi / 10, 0, 0]) 
-            low = np.array([4.5, car_l / 2 + 2.5, 0, 0, 0])
+            low = np.array([-2.5, car_l / 2 + 2.5, 0, 0, 0])
         return high, low
 
     def _get_car_geometry(self) -> sg.Polygon:

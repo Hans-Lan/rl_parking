@@ -10,7 +10,7 @@ from rl_parking.utils.fs import PROJECT_ROOT
 ray.tune.registry.register_env('bosch_epf_parking', env_creator)
 
 stop_criteria = {
-    'timesteps_total': int(8e6),
+    'timesteps_total': int(2e7),
 }
 
 agent_config = {
@@ -18,7 +18,7 @@ agent_config = {
     'env': 'bosch_epf_parking',
     'env_config': {
         'mode': 'vertical',
-        'total_iters': 200,
+        'total_iters': 300,
         'jump_start': True,
     },
 
