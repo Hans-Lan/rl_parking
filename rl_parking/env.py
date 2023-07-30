@@ -10,6 +10,13 @@ from ray.rllib.env.env_context import EnvContext
 from rl_parking.utils.wrapper import TimeLimit
 
 
+def angle_fix(angle: float) -> float:
+    '''
+        Fix angle to [-pi, pi)
+    '''
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
 @dataclass
 class ParkingConfig:
     '''
@@ -23,7 +30,7 @@ class ParkingConfig:
     car_axle_to_back: float = 1.102
 
     # Parking lot
-    mode: str = 'parallel'  # 'parallel' or 'vertical'
+    mode: str = 'parallel'  # 'parallel' or 'vertical' or 'vertical2'
     lot_margin: float = 1.0
     lot_length: float = None
     lot_width: float = None
@@ -48,8 +55,8 @@ def create_parking_lot(config: ParkingConfig) -> sg.MultiLineString:
     lot_length = config.lot_length
     lot_width = config.lot_width
     if mode == 'parallel':
-        l = lot_length / 2
-        w = lot_width / 2
+        l = lot_length / 2 + 1.0
+        w = lot_width / 2 + 0.2
         left_line = sg.LineString([(-12, w), (-l, w)])
         right_line = sg.LineString([(12, w), (l, w)])
         wall = sg.LineString([(-12, 8 + w), (12, 8 + w)])
@@ -63,6 +70,14 @@ def create_parking_lot(config: ParkingConfig) -> sg.MultiLineString:
         wall = sg.LineString([(-12, 6.5 + l), (12, 6.5 + l)])
         lot_boundary = sg.LineString([(-w, l), (-w, -l), (w, -l), (w, l)])
         parking_lot = sg.MultiLineString([left_line, right_line, wall, lot_boundary])
+    elif mode == 'vertical2':
+        l = lot_length / 2
+        w = lot_width / 2 + 0.2
+        left_wall = sg.LineString([(-w, -l), (-w, l), (-w - 2, l), (-w - 2, 6.5 + l)])
+        right_lines = sg.LineString([(w, l), (w + 5, l), (w + 5, -l), (15, -l)])
+        upper_wall = sg.LineString([(-w - 2, 6.5 + l), (15, 6.5 + l)])
+        lot_boundary = sg.LineString([(-w, -l), (w, -l), (w, l)])
+        parking_lot = sg.MultiLineString([left_wall, right_lines, upper_wall, lot_boundary])
     else:
         raise ValueError(f'Unknown parking mode: {mode}')
 
@@ -79,6 +94,8 @@ class ParkingLots(gym.Env):
         car_l = config.car_length
         car_w = config.car_width
         car_d = config.car_axle_to_back
+
+        self.x_limit = 12
         if config.mode == 'parallel':
             self.init_states_high = np.array([5 + car_l, 4 + car_w / 2, np.pi / 4, 0, 0])
             self.init_states_low = np.array([-5 - car_l, 1 + car_w / 2, -np.pi / 4, 0, 0])
@@ -89,10 +106,16 @@ class ParkingLots(gym.Env):
             self.init_states_high = np.array([car_l, 3.5 + car_l / 2, np.pi / 12, 0, 0])
             self.init_states_low = np.array([car_w + 1, 2.5 + car_l / 2, -np.pi / 20, 0, 0])
             self.terminal_states = np.array([0, -car_l / 2 + car_d, np.pi / 2, 0, 0])
+        elif config.mode == 'vertical2':
+            self.init_states_high = np.array([7.0, 3.0 + car_l / 2, np.pi + 0.1, 0, 0])
+            self.init_states_low = np.array([5.0, 2.5 + car_l / 2, np.pi - 0.1, 0, 0])
+            self.terminal_states = np.array([0, -car_l / 2 + car_d, np.pi / 2, 0, 0])
+            self.x_limit = 14.5
         else:
             raise ValueError(f'Unknown parking mode: {config.mode}')
         self.admissible_errors = np.array([0.1, 0.1, 0.1, 0.4, np.pi / 5])
-        self.x_limit = 12
+        if config.mode == 'parallel':
+            self.admissible_errors[:2] = 0.2
 
         # action: [a, d_steer]
         self.action_space = gym.spaces.Box(
@@ -114,6 +137,36 @@ class ParkingLots(gym.Env):
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
+
+    def inverse_dyna(self, state, step_count: int):
+        L = self.config.car_wheelbase
+        dt = self.config.dt
+        x, y, theta, v, steer = state
+        for _ in range(step_count):
+            x = x + v * np.cos(theta) * dt
+            y = y + v * np.sin(theta) * dt
+            theta = theta + v / L * np.tan(steer) * dt
+            v = v
+            steer = steer
+
+        # limit v and steer
+        return np.array([x, y, theta, v, steer])
+
+    def inverse_dyna_rollout(self, state: np.ndarray, steps: int) -> np.ndarray:
+        state = state.copy()
+        state[3] = 0.3
+        commands = [np.pi / 5, 0, -np.pi / 5, 0]
+        max_steps = [80, 120, 80, 130]
+        for i in range(4):
+            state[-1] = commands[i]
+            count = np.clip(steps, 0, max_steps[i])
+            state = self.inverse_dyna(state, count)
+            steps -= count
+            if steps <= 0:
+                break
+        state[3] = 0.0
+        state[-1] = 0.0
+        return state
 
     def step(self, action):
         a, d_steer = action
@@ -167,9 +220,12 @@ class ParkingLots(gym.Env):
             self.easy = easy
             # jump from easy init state
             if easy and self.config.mode == 'parallel':
-                pass
+                self.state = self.jump_start_parallel()
+                return self._get_obs()
             elif easy and self.config.mode == 'vertical':
                 high, low = self.jump_start_vertical()
+            elif easy and self.config.mode == 'vertical2':
+                high, low = self.jump_start_vertical2()
             else:
                 pass
         self.state = self.np_random.uniform(low=low, high=high)
@@ -202,7 +258,7 @@ class ParkingLots(gym.Env):
             mode = self.np_random.choice(3, p=[1-p, p, 0.0])
         else:
             mode = self.np_random.choice(3, p=[0.1, 0.6, 0.3])
-        # mode = 1
+        # mode = 2
         if mode == 0:
             high = np.array([0.1, -car_l / 2 + car_d + 3.5, np.pi / 2 + 0.1, 0, 0])
             low = np.array([-0.1, -car_l / 2 + car_d + 0.2, np.pi / 2 - 0.1, 0, 0])
@@ -226,6 +282,60 @@ class ParkingLots(gym.Env):
             high = np.array([5.5, car_l / 2 + 3.5, np.pi / 10, 0, 0]) 
             low = np.array([-2.5, car_l / 2 + 2.5, 0, 0, 0])
         return high, low
+    
+    def jump_start_vertical2(self) -> Tuple[np.ndarray, np.ndarray]:
+        car_l = self.config.car_length
+        car_w = self.config.car_width
+        car_d = self.config.car_axle_to_back
+        if self.frac < 0.5:
+            mode = self.np_random.choice(3, p=[0.7, 0.3, 0.0])
+        elif self.frac < 1.0:
+            p = self.frac * 0.6
+            mode = self.np_random.choice(3, p=[1-p, p, 0.0])
+        else:
+            p = np.clip((self.frac - 1.0) * 0.4, 0.1, 0.7)
+            mode = self.np_random.choice(3, p=[0.2 * (1-p), 0.8 * (1-p), p])
+        if mode == 0:
+            high = np.array([0.1, -car_l / 2 + car_d + 3.5, np.pi / 2 + 0.1, 0, 0])
+            low = np.array([-0.1, -car_l / 2 + car_d + 0.2, np.pi / 2 - 0.1, 0, 0])
+        elif mode == 1:
+            y_bias = self.np_random.uniform(low=0.0, high=2.5)
+            ang_bias = np.pi / 2 - (y_bias - 0.0) / 2.5 * np.pi / 3
+            if y_bias < 1.5:
+                x_bias_high = 0.
+                x_bias_low = 0.
+            else:
+                x_bias_high = (y_bias - 1.5)
+                x_bias_low = 0.5
+            high = np.array([0.5 + x_bias_high, car_l / 2 + y_bias + 0.5, ang_bias + 0.2, 0, 0])
+            low = np.array([-0.5 + x_bias_low, car_l / 2 + y_bias, ang_bias - 0.2, 0, 0])
+        elif mode == 2:
+            high = np.array([7.5, car_l / 2 + 3.5, np.pi / 15, 0, 0])
+            low = np.array([3.5, car_l / 2 + 2.5, 0.0, 0, 0])
+        return high, low
+
+    # def final_reward_vertical(self) -> float:
+    #     # for vertical parking only, called when time limit is reached
+    #     x, y, theta, *_ = self.state
+    #     x_error = np.abs(x - self.terminal_states[0])
+    #     y_error = np.abs(y - self.terminal_states[1])
+    #     theta_error = np.abs(angle_fix(theta - self.terminal_states[2]))
+    #     if x_error < self.config.car_width and theta_error < np.pi / 4:
+    #         return np.maximum(10 - (x_error + y_error / 2 + theta_error * 2) * 2, 0)
+    #     else:
+    #         return 0.
+
+    def jump_start_parallel(self) -> np.ndarray:
+        car_l = self.config.car_length
+        car_d = self.config.car_axle_to_back
+        d = -car_l / 2 + car_d
+        x = self.np_random.uniform(low=-0.85, high=-0.8) + d
+        y = self.np_random.uniform(low=0.0, high=0.05)
+        # theta = self.np_random.uniform(low=-np.pi / 4, high=np.pi / 4)
+        init_state = np.array([x, y, 0, 0, 0])
+        steps = int(self.frac * 300)
+        high = np.maximum(10, steps)
+        return self.inverse_dyna_rollout(init_state, self.np_random.randint(low=0, high=high))
 
     def _get_car_geometry(self) -> sg.Polygon:
         x, y, theta, *_ = self.state
@@ -250,7 +360,9 @@ class ParkingLots(gym.Env):
         return x < -self.x_limit or x > self.x_limit
     
     def _parked(self) -> bool:
-        state_errors = np.abs(self.state - self.terminal_states)
+        state_errors = self.state - self.terminal_states
+        state_errors[2] = angle_fix(state_errors[2])
+        state_errors = np.abs(state_errors)
         return np.all(state_errors < self.admissible_errors)
 
     def _terminal_cost(self) -> float:
